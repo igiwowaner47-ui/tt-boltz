@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import random
 import tarfile
+import tempfile
 import time
 import traceback
 import urllib.request
@@ -213,6 +214,85 @@ def to_batch(feats: dict, device: torch.device) -> dict:
         else:
             batch[k] = v
     return batch
+
+
+def extract_global_topology_features(
+    model: Boltz2,
+    tokenizer: Boltz2Tokenizer,
+    featurizer: Boltz2Featurizer,
+    ccd,
+    mol_dir: Path,
+    msa_dir: Path,
+    *,
+    boltz_yaml_path: Path | None = None,
+    aa_seq: str | None = None,
+    wt_name: str = "wt",
+    device: torch.device | None = None,
+    precision: torch.dtype = torch.bfloat16,
+    recycling_steps: int = 0,
+    use_msa_server: bool = False,
+    msa_server_url: str = "https://api.colabfold.com",
+    msa_pairing_strategy: str = "greedy",
+    msa_server_username: str | None = None,
+    msa_server_password: str | None = None,
+    api_key: str | None = None,
+    max_msa_seqs: int = 4096,
+) -> torch.Tensor:
+    """Extract Boltz-2 global topology single representation (S_boltz).
+
+    Returns a tensor with shape [B, L, D_boltz].
+    """
+    if (boltz_yaml_path is None) == (aa_seq is None):
+        raise ValueError("Provide exactly one of boltz_yaml_path or aa_seq")
+
+    device = device or next(model.parameters()).device
+
+    cleanup_paths = []
+    if boltz_yaml_path is not None:
+        input_path = Path(boltz_yaml_path)
+    else:
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as msa_f:
+            msa_f.write(f"key,sequence\n-1,{aa_seq.strip()}\n")
+            msa_csv = Path(msa_f.name)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as yml_f:
+            yml_f.write(
+                "version: 1\n"
+                "sequences:\n"
+                "  - protein:\n"
+                f"      id: {wt_name}\n"
+                f"      sequence: {aa_seq.strip()}\n"
+                f"      msa: {msa_csv}\n"
+            )
+            input_path = Path(yml_f.name)
+        cleanup_paths.extend([msa_csv, input_path])
+
+    try:
+        feats, _ = prepare_features(
+            input_path,
+            ccd=ccd,
+            mol_dir=mol_dir,
+            msa_dir=msa_dir,
+            tokenizer=tokenizer,
+            featurizer=featurizer,
+            use_msa=use_msa_server,
+            msa_url=msa_server_url,
+            msa_strategy=msa_pairing_strategy,
+            msa_user=msa_server_username,
+            msa_pass=msa_server_password,
+            api_key=api_key,
+            max_msa=max_msa_seqs,
+        )
+        batch = to_batch(feats, device)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=precision):
+            s_boltz = model.extract_single_representation(
+                batch,
+                recycling_steps=recycling_steps,
+            )
+        return s_boltz
+    finally:
+        for p in cleanup_paths:
+            if p.exists():
+                p.unlink()
 
 
 def write_result(pred, batch, input_struct, out_dir, fmt,

@@ -105,6 +105,44 @@ properties:
     sequence: ...
 ```
 
+
+### Global Topology Single Representation (S_boltz)
+
+For lightweight global-topology extraction (without running the heavy structure diffusion branch), use:
+
+```python
+from pathlib import Path
+import torch
+from tt_boltz.boltz2 import Boltz2
+from tt_boltz.main import extract_global_topology_features
+from tt_boltz.data.tokenize import Boltz2Tokenizer
+from tt_boltz.data.featurizer import Boltz2Featurizer
+from tt_boltz.data.mol import load_canonicals
+
+model = Boltz2.load_from_checkpoint("~/.boltz/boltz2_conf.ckpt").eval().to("cuda")
+tokenizer = Boltz2Tokenizer()
+featurizer = Boltz2Featurizer()
+ccd = load_canonicals(Path("~/.boltz/mols").expanduser())
+
+s_boltz = extract_global_topology_features(
+    model,
+    tokenizer,
+    featurizer,
+    ccd,
+    mol_dir=Path("~/.boltz/mols").expanduser(),
+    msa_dir=Path("./msa"),
+    boltz_yaml_path=Path("examples/prot.yaml"),  # or aa_seq="MKT..."
+    wt_name="wt",
+    device=torch.device("cuda"),
+    precision=torch.bfloat16,
+)
+
+print(s_boltz.shape)  # [B, L, D_boltz]
+```
+
+Internally this calls `Boltz2.extract_single_representation(...)` in inference mode and returns the trunk single representation `s` only.
+When `aa_seq` is provided (without YAML), the helper builds a temporary single-sequence MSA entry so extraction can run without entering heavy generation branches.
+
 ## Understanding Results
 
 ### Output Structure
