@@ -5144,78 +5144,11 @@ class Boltz2(nn.Module):
                 if hasattr(m, 'reset_static_cache'):
                     m.reset_static_cache()
 
-        if self.trace:
-            print("[boltz2] forward: input_embedder")
-        
-        s_inputs = self.input_embedder(feats)
-
-        # Initialize the sequence embeddings
-        s_init = self.s_init(s_inputs)
-
-        # Initialize pairwise embeddings
-        z_init = (
-            self.z_init_1(s_inputs)[:, :, None]
-            + self.z_init_2(s_inputs)[:, None, :]
+        s_inputs, s, z, relative_position_encoding = self._run_trunk(
+            feats=feats,
+            recycling_steps=recycling_steps,
+            run_main_blocks=self.run_trunk_and_structure,
         )
-        relative_position_encoding = self.rel_pos(feats)
-        z_init = z_init + relative_position_encoding
-        z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-        if self.bond_type_feature:
-            z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
-        z_init = z_init + self.contact_conditioning(feats)
-
-        # Perform rounds of the pairwise stack
-        s = torch.zeros_like(s_init)
-        z = torch.zeros_like(z_init)
-
-        # Compute pairwise mask
-        mask = feats["token_pad_mask"].float()
-        pair_mask = mask[:, :, None] * mask[:, None, :]
-        if self.run_trunk_and_structure:
-            for i in range(recycling_steps + 1):
-                # Apply recycling
-                s = s_init + self.s_recycle(self.s_norm(s))
-                z = z_init + self.z_recycle(self.z_norm(z))
-
-                # Compute pairwise stack
-                if self.use_templates:
-                    if self.trace:
-                        print("[boltz2] template_module")
-                    if self.is_template_compiled:
-                        template_module = self.template_module._orig_mod  # noqa: SLF001
-                    else:
-                        template_module = self.template_module
-
-                    z = z + template_module(
-                        z, feats, pair_mask, use_kernels=self.use_kernels
-                    )
-
-                if self.trace:
-                    print("[boltz2] msa_module")
-                if self.is_msa_compiled:
-                    msa_module = self.msa_module._orig_mod  # noqa: SLF001
-                else:
-                    msa_module = self.msa_module
-
-                z = z + msa_module(
-                    z, s_inputs, feats, use_kernels=self.use_kernels
-                )
-
-                # Revert to uncompiled version for validation
-                if self.trace:
-                    print("[boltz2] pairformer_module")
-                if self.is_pairformer_compiled:
-                    pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
-                else:
-                    pairformer_module = self.pairformer_module
-
-                s, z = pairformer_module(
-                    s,
-                    z,
-                    mask=mask,
-                    pair_mask=pair_mask,
-                    use_kernels=self.use_kernels,
-                )
 
         pdistogram = self.distogram_module(z)
         dict_out = {
@@ -5409,6 +5342,107 @@ class Boltz2(nn.Module):
 
         return dict_out
 
+    def _run_trunk(
+        self,
+        feats: dict[str, Tensor],
+        recycling_steps: int,
+        run_main_blocks: bool,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run Boltz-2 encoder trunk and return trunk features.
+
+        Returns
+        -------
+        tuple[Tensor, Tensor, Tensor, Tensor]
+            (s_inputs, s, z, relative_position_encoding)
+        """
+        if self.trace:
+            print("[boltz2] forward: input_embedder")
+
+        s_inputs = self.input_embedder(feats)
+
+        s_init = self.s_init(s_inputs)
+        z_init = (
+            self.z_init_1(s_inputs)[:, :, None]
+            + self.z_init_2(s_inputs)[:, None, :]
+        )
+        relative_position_encoding = self.rel_pos(feats)
+        z_init = z_init + relative_position_encoding
+        z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+        if self.bond_type_feature:
+            z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
+        z_init = z_init + self.contact_conditioning(feats)
+
+        s = torch.zeros_like(s_init)
+        z = torch.zeros_like(z_init)
+
+        mask = feats["token_pad_mask"].float()
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+
+        if run_main_blocks:
+            for _ in range(recycling_steps + 1):
+                s = s_init + self.s_recycle(self.s_norm(s))
+                z = z_init + self.z_recycle(self.z_norm(z))
+
+                if self.use_templates:
+                    if self.trace:
+                        print("[boltz2] template_module")
+                    if self.is_template_compiled:
+                        template_module = self.template_module._orig_mod  # noqa: SLF001
+                    else:
+                        template_module = self.template_module
+
+                    z = z + template_module(
+                        z, feats, pair_mask, use_kernels=self.use_kernels
+                    )
+
+                if self.trace:
+                    print("[boltz2] msa_module")
+                if self.is_msa_compiled:
+                    msa_module = self.msa_module._orig_mod  # noqa: SLF001
+                else:
+                    msa_module = self.msa_module
+
+                z = z + msa_module(z, s_inputs, feats, use_kernels=self.use_kernels)
+
+                if self.trace:
+                    print("[boltz2] pairformer_module")
+                if self.is_pairformer_compiled:
+                    pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                else:
+                    pairformer_module = self.pairformer_module
+
+                s, z = pairformer_module(
+                    s,
+                    z,
+                    mask=mask,
+                    pair_mask=pair_mask,
+                    use_kernels=self.use_kernels,
+                )
+
+        return s_inputs, s, z, relative_position_encoding
+
+    @torch.no_grad()
+    def extract_single_representation(
+        self,
+        feats: dict[str, Tensor],
+        recycling_steps: int = 0,
+    ) -> Tensor:
+        """Extract Boltz-2 trunk single representation for global topology use.
+
+        This method runs in inference mode and bypasses the heavy structure
+        generation branch, returning the per-token tensor with shape [B, L, D].
+        """
+        was_training = self.training
+        self.eval()
+        _, s, _, _ = self._run_trunk(
+            feats=feats,
+            recycling_steps=recycling_steps,
+            run_main_blocks=True,
+        )
+        if was_training:
+            self.train()
+        return s
+
     @classmethod
     def load_from_checkpoint(
         cls,
@@ -5554,4 +5588,3 @@ class Boltz2(nn.Module):
                 return {"exception": True}
             else:
                 raise e
-
